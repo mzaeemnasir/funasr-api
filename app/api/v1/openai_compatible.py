@@ -4,13 +4,15 @@ OpenAI 兼容 API
 实现 OpenAI Audio API 规范，兼容 OpenAI SDK 和第三方客户端
 """
 
+import asyncio
+import json
 import time
 import logging
 from typing import Optional, List
 from enum import Enum
 
 from fastapi import APIRouter, File, Form, UploadFile, Request, HTTPException
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from ...core.config import settings
@@ -27,6 +29,7 @@ from ...services.audio import get_audio_service
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/v1", tags=["OpenAI Compatible"])
+HEARTBEAT_INTERVAL_SECONDS = 15.0
 
 
 # ============= 枚举类型 =============
@@ -168,6 +171,157 @@ def map_model_id(model: str) -> Optional[str]:
 
     # 其他情况直接使用原模型 ID
     return model
+
+
+def detect_language(text: str, language: Optional[str]) -> str:
+    """检测识别语言。"""
+    if language:
+        return language
+
+    import re
+
+    if re.search(r"[\u4e00-\u9fff]", text):
+        return "zh"
+    return "en"
+
+
+def build_transcription_payload(
+    *,
+    response_format: ResponseFormat,
+    asr_result,
+    audio_duration: float,
+    language: Optional[str],
+) -> tuple[object, int, int]:
+    """构建 OpenAI 转写响应载荷，并返回 segments / words 计数。"""
+    segments: List[TranscriptionSegment] = []
+    words: List[TranscriptionWord] = []
+
+    for i, seg in enumerate(asr_result.segments):
+        segments.append(
+            TranscriptionSegment(
+                id=i,
+                seek=int(seg.start_time * 100),
+                start=seg.start_time,
+                end=seg.end_time,
+                text=seg.text,
+                speaker=seg.speaker_id,
+            )
+        )
+        if seg.word_tokens:
+            for wt in seg.word_tokens:
+                words.append(
+                    TranscriptionWord(
+                        word=wt.text,
+                        start=round(seg.start_time + wt.start_time, 3),
+                        end=round(seg.start_time + wt.end_time, 3),
+                    )
+                )
+
+    detected_language = detect_language(asr_result.text, language)
+
+    if response_format == ResponseFormat.VERBOSE_JSON:
+        payload = VerboseTranscriptionResponse(
+            task="transcribe",
+            language=detected_language,
+            duration=audio_duration,
+            text=asr_result.text,
+            segments=segments,
+            words=words if words else None,
+        ).model_dump()
+    elif response_format == ResponseFormat.JSON:
+        payload = {"text": asr_result.text}
+    elif response_format == ResponseFormat.TEXT:
+        payload = asr_result.text
+    elif response_format == ResponseFormat.SRT:
+        if not segments:
+            segments = [
+                TranscriptionSegment(
+                    id=0,
+                    start=0,
+                    end=audio_duration,
+                    text=asr_result.text,
+                )
+            ]
+        payload = generate_srt(segments)
+    elif response_format == ResponseFormat.VTT:
+        if not segments:
+            segments = [
+                TranscriptionSegment(
+                    id=0,
+                    start=0,
+                    end=audio_duration,
+                    text=asr_result.text,
+                )
+            ]
+        payload = generate_vtt(segments)
+    else:
+        payload = {"text": asr_result.text}
+
+    return payload, len(segments), len(words)
+
+
+def create_heartbeat_streaming_response(
+    *,
+    response_format: ResponseFormat,
+    inference_coro,
+    audio_duration: float,
+    language: Optional[str],
+    cleanup_callback,
+) -> StreamingResponse:
+    """为长耗时 JSON 响应生成带心跳的流式输出。"""
+
+    async def response_stream():
+        inference_task = asyncio.create_task(inference_coro)
+        heartbeat_count = 0
+
+        try:
+            while not inference_task.done():
+                await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
+                if inference_task.done():
+                    break
+
+                heartbeat_count += 1
+                logger.info(
+                    "[OpenAI API] 发送响应心跳: "
+                    f"format={response_format}, heartbeat_count={heartbeat_count}"
+                )
+                yield b" \n"
+
+            asr_result = await inference_task
+            logger.info(f"[OpenAI API] 识别完成: {len(asr_result.text)} 字符")
+
+            payload, segments_count, words_count = build_transcription_payload(
+                response_format=response_format,
+                asr_result=asr_result,
+                audio_duration=audio_duration,
+                language=language,
+            )
+            response_bytes = json.dumps(
+                payload,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+
+            logger.info(
+                "[OpenAI API] 准备发送 JSON 响应: "
+                f"format={response_format}, "
+                f"segments={segments_count}, "
+                f"words={words_count}, "
+                f"payload_bytes={len(response_bytes)}, "
+                f"heartbeat_count={heartbeat_count}"
+            )
+            yield response_bytes
+        finally:
+            cleanup_callback()
+
+    return StreamingResponse(
+        response_stream(),
+        media_type="application/json",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 # ============= API 端点 =============
@@ -398,6 +552,7 @@ async def create_transcription(
 
     audio_path = None
     normalized_audio_path = None
+    response_cleanup_managed = False
 
     # 性能计时
     request_start_time = time.time()
@@ -461,9 +616,7 @@ async def create_transcription(
         model_manager = get_model_manager()
         asr_engine = model_manager.get_asr_engine(mapped_model_id)
 
-        # 执行语音识别
-        # 注：prompt 参数接收但不使用，FunASR 热词格式与 OpenAI prompt 不兼容
-        asr_result = await run_sync(
+        inference_coro = run_sync(
             asr_engine.transcribe_long_audio,
             audio_path=normalized_audio_path,
             hotwords="",
@@ -474,78 +627,63 @@ async def create_transcription(
             word_timestamps=word_timestamps,
         )
 
-        logger.info(f"[OpenAI API] 识别完成: {len(asr_result.text)} 字符")
-
-        # 构建分段信息
-        segments = []
-        words = []
-        for i, seg in enumerate(asr_result.segments):
-            segments.append(TranscriptionSegment(
-                id=i,
-                seek=int(seg.start_time * 100),
-                start=seg.start_time,
-                end=seg.end_time,
-                text=seg.text,
-                speaker=seg.speaker_id,
-            ))
-            # 收集字词级时间戳（加上 segment 起始时间，转换为全局时间戳）
-            if seg.word_tokens:
-                for wt in seg.word_tokens:
-                    words.append(TranscriptionWord(
-                        word=wt.text,
-                        start=round(seg.start_time + wt.start_time, 3),
-                        end=round(seg.start_time + wt.end_time, 3),
-                    ))
-
-        # 检测语言 (简单实现)
-        detected_language = language or "zh"
-        if not language:
-            # 简单的语言检测：检查是否包含中文字符
-            import re
-            if re.search(r'[\u4e00-\u9fff]', asr_result.text):
-                detected_language = "zh"
-            else:
-                detected_language = "en"
-
         # 根据 response_format 返回不同格式
         if response_format == ResponseFormat.TEXT:
-            return PlainTextResponse(content=asr_result.text)
+            asr_result = await inference_coro
+            logger.info(f"[OpenAI API] 识别完成: {len(asr_result.text)} 字符")
+            payload, _, _ = build_transcription_payload(
+                response_format=response_format,
+                asr_result=asr_result,
+                audio_duration=audio_duration,
+                language=language,
+            )
+            return PlainTextResponse(content=payload)
 
         elif response_format == ResponseFormat.SRT:
-            if not segments:
-                # 如果没有分段，创建一个完整的分段
-                segments = [TranscriptionSegment(
-                    id=0,
-                    start=0,
-                    end=audio_duration,
-                    text=asr_result.text,
-                )]
-            srt_content = generate_srt(segments)
-            return PlainTextResponse(content=srt_content, media_type="text/plain")
+            asr_result = await inference_coro
+            logger.info(f"[OpenAI API] 识别完成: {len(asr_result.text)} 字符")
+            payload, _, _ = build_transcription_payload(
+                response_format=response_format,
+                asr_result=asr_result,
+                audio_duration=audio_duration,
+                language=language,
+            )
+            return PlainTextResponse(content=payload, media_type="text/plain")
 
         elif response_format == ResponseFormat.VTT:
-            if not segments:
-                segments = [TranscriptionSegment(
-                    id=0,
-                    start=0,
-                    end=audio_duration,
-                    text=asr_result.text,
-                )]
-            vtt_content = generate_vtt(segments)
-            return PlainTextResponse(content=vtt_content, media_type="text/vtt")
+            asr_result = await inference_coro
+            logger.info(f"[OpenAI API] 识别完成: {len(asr_result.text)} 字符")
+            payload, _, _ = build_transcription_payload(
+                response_format=response_format,
+                asr_result=asr_result,
+                audio_duration=audio_duration,
+                language=language,
+            )
+            return PlainTextResponse(content=payload, media_type="text/vtt")
 
-        elif response_format == ResponseFormat.VERBOSE_JSON:
-            return JSONResponse(content=VerboseTranscriptionResponse(
-                task="transcribe",
-                language=detected_language,
-                duration=audio_duration,
-                text=asr_result.text,
-                segments=[seg.model_dump() for seg in segments],
-                words=[w.model_dump() for w in words] if words else None,
-            ).model_dump())
+        elif response_format in {ResponseFormat.VERBOSE_JSON, ResponseFormat.JSON}:
+            response_cleanup_managed = True
+            return create_heartbeat_streaming_response(
+                response_format=response_format,
+                inference_coro=inference_coro,
+                audio_duration=audio_duration,
+                language=language,
+                cleanup_callback=lambda: audio_service.cleanup(
+                    audio_path,
+                    normalized_audio_path,
+                ),
+            )
 
-        else:  # JSON (默认)
-            return JSONResponse(content={"text": asr_result.text})
+        else:
+            asr_result = await inference_coro
+            logger.info(f"[OpenAI API] 识别完成: {len(asr_result.text)} 字符")
+            payload, _, _ = build_transcription_payload(
+                response_format=ResponseFormat.JSON,
+                asr_result=asr_result,
+                audio_duration=audio_duration,
+                language=language,
+            )
+            return JSONResponse(content=payload)
 
     except HTTPException as http_exc:
         # 将 HTTPException 转换为标准错误格式
@@ -567,5 +705,5 @@ async def create_transcription(
         return JSONResponse(content=response_data, status_code=500)
 
     finally:
-        # 使用音频服务清理临时文件
-        audio_service.cleanup(audio_path, normalized_audio_path)
+        if not response_cleanup_managed:
+            audio_service.cleanup(audio_path, normalized_audio_path)
